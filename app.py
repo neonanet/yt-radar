@@ -31,7 +31,7 @@ st.markdown(
 
 Анализ проводится в двух уровнях:
 
-1. **Анализ внутри одного снапшота**  
+1. **Аналитика одного снапшота**  
 2. **Динамика между снапшотами** — сравнение двух: последнего и предпоследнего, поиск роста/падения.
 """
 )
@@ -532,21 +532,26 @@ def clean_tag(raw_tag: str):
     if not tag:
         return None
 
+    # очень короткий тег не берём
     if len(tag) < 2:
         return None
 
+    # чисто цифры не берём
     if tag.isdigit():
         return None
 
+    # если почти одни неалфанум, тоже не берём
     alnum_count = sum(ch.isalnum() for ch in tag)
     if alnum_count == 0:
         return None
     if alnum_count / len(tag) < 0.4:
         return None
 
+    # стоп-слова
     if tag in STOP_TAGS:
         return None
 
+    # стоп-подстроки
     for sub in EXTRA_STOP_SUBSTR:
         if sub in tag:
             return None
@@ -666,6 +671,7 @@ def load_snapshots_from_directory(directory: str) -> pd.DataFrame:
     if "category_id" in full.columns:
         full["category_id"] = full["category_id"].astype(str)
 
+    # собрать и почистить теги
     full = build_all_tags_uniq(full)
 
     return full
@@ -875,6 +881,7 @@ def compute_tag_metrics_for_df_slice(
     if tag_agg.empty:
         return tag_agg
 
+    # перцентили и медианы для статусов
     p75_velocity = float(tag_agg["velocity"].quantile(0.75))
     p90_velocity = float(tag_agg["velocity"].quantile(0.90))
     p75_volume = float(tag_agg["volume"].quantile(0.75))
@@ -886,11 +893,13 @@ def compute_tag_metrics_for_df_slice(
 
     tag_agg["status"] = "Other"
 
+    # Trending: очень высокая скорость, много свежих
     trending_mask = (tag_agg["velocity"] >= p90_velocity) & (
         tag_agg["freshness"] > 0.5
     )
     tag_agg.loc[trending_mask, "status"] = "Trending"
 
+    # Emerging: скорость выше 75 перцентиля, но объём ещё не огромный
     emerging_mask = (
         (tag_agg["status"] == "Other")
         & (tag_agg["velocity"] >= p75_velocity)
@@ -899,6 +908,7 @@ def compute_tag_metrics_for_df_slice(
     )
     tag_agg.loc[emerging_mask, "status"] = "Emerging"
 
+    # Declining: был большой объём, но скорость и свежесть низкие
     declining_mask = (
         (tag_agg["status"] == "Other")
         & (tag_agg["volume"] >= p75_volume)
@@ -907,6 +917,7 @@ def compute_tag_metrics_for_df_slice(
     )
     tag_agg.loc[declining_mask, "status"] = "Declining"
 
+    # Mature: устойчиво большая тема с нормальной скоростью
     mature_mask = (
         (tag_agg["status"] == "Other")
         & (tag_agg["volume"] >= p75_volume)
@@ -915,6 +926,7 @@ def compute_tag_metrics_for_df_slice(
     )
     tag_agg.loc[mature_mask, "status"] = "Mature"
 
+    # Frozen: и объём не очень, и скорости/свежести нет
     frozen_mask = (
         (tag_agg["status"] == "Other")
         & (tag_agg["volume"] < median_volume)
@@ -1016,7 +1028,11 @@ st.sidebar.header("Режим анализа")
 
 page = st.sidebar.radio(
     "Выбери, что смотреть:",
-    options=["Аналитика одного снапшота", "Динамика между снапшотами"],
+    options=[
+        "Аналитика одного снапшота",
+        "Динамика между снапшотами",
+        "Песочница",
+    ],
 )
 
 # ===================================================================
@@ -2142,6 +2158,7 @@ elif page == "Динамика между снапшотами":
                     f"{(ts2_vid - ts1_vid).total_seconds() / 3600:.1f} часов."
                 )
 
+                # колонка категории берётся по позднему снапшоту
                 cat_col_v = (
                     "category_name_t2"
                     if "category_name_t2" in growth_df.columns
@@ -2156,12 +2173,17 @@ elif page == "Динамика между снапшотами":
                     key="dyn_vid_shorts",
                 )
 
-                selected_cats_v = st.multiselect(
-                    "Категории (по позднему снапшоту)",
-                    options=all_cats_v,
-                    default=all_cats_v,
-                    key="dyn_vid_cats",
-                )
+                # вместо мультивыбора — один выпадающий список
+                if all_cats_v:
+                    selected_cat_v = st.selectbox(
+                        "Категория (по позднему снапшоту)",
+                        options=all_cats_v,
+                        index=0,
+                        key="dyn_vid_cat_single",
+                    )
+                    selected_cats_v = [selected_cat_v]
+                else:
+                    selected_cats_v = []
 
                 top_n_v = st.slider(
                     "Сколько видео показать",
@@ -2304,3 +2326,517 @@ elif page == "Динамика между снапшотами":
 
                     with st.expander("Сырые строки по видео"):
                         st.dataframe(filtered_v, use_container_width=True)
+
+# ===================================================================
+#                 СТРАНИЦА 3. ПЕСОЧНИЦА ДАННЫХ
+# ===================================================================
+
+elif page == "Песочница":
+    st.subheader("Песочница (лаборатория радара)")
+
+    st.markdown(
+        """
+Здесь можно:
+
+- посмотреть, **как ведёт себя конкретный тег во времени** (по всем снапшотам);
+- собрать себе выборку сырых строк по фильтрам и выгрузить её в CSV;
+- загрузить отдельный CSV и покрутить его отдельно.
+"""
+    )
+
+    # общий список категорий для всех вкладок песочницы
+    all_cats_sandbox = (
+        full_df[["category_id", "category_name"]]
+        .drop_duplicates()
+        .sort_values("category_name")
+    )
+    cat_display_list = [
+        "Все категории"
+    ] + [
+        f"{row.category_name} (id={row.category_id})"
+        for row in all_cats_sandbox.itertuples(index=False)
+    ]
+
+    tab_tag_radar, tab_snap, tab_upload = st.tabs(
+        ["Радар по тегам", "Фильтр сырых строк", "Загрузить CSV"]
+    )
+
+    # ---------- Вкладка 1: радар по тегам ----------
+    with tab_tag_radar:
+        st.markdown(
+            """
+Здесь можно посмотреть, как **одна тема (тег)** живёт во времени:
+
+- выбираем тег (или часть слова),
+- категорию (или все),
+- `fresh_hours` и минимальное число видео с тегом.
+
+Дальше строим:
+- тайм-серию по объёму, скорости новых видео и свежести;
+- тепловую карту «тег × снапшот» по скорости;
+- срез по тегам в **последнем** снапшоте.
+"""
+        )
+
+        col_controls = st.columns(4)
+        with col_controls[0]:
+            search_tag = st.text_input(
+                "Тег или часть тега (без #)",
+                value="",
+                help="Например: ai, iphone, cover",
+                key="sandbox_tag_search",
+            )
+        with col_controls[1]:
+            match_mode = st.selectbox(
+                "Как искать",
+                options=["Содержит подстроку", "Точное совпадение"],
+                index=0,
+                key="sandbox_tag_match_mode",
+            )
+
+        with col_controls[2]:
+            cat_option_tag = st.selectbox(
+                "Категория",
+                options=cat_display_list,
+                index=0,
+                key="sandbox_tag_cat",
+            )
+
+        with col_controls[3]:
+            fresh_hours_tag_radar = st.number_input(
+                "fresh_hours (часы для свежести)",
+                min_value=1.0,
+                max_value=168.0,
+                value=DEFAULT_FRESH_HOURS,
+                step=1.0,
+                key="sandbox_tag_fresh_hours",
+            )
+
+        col_bottom = st.columns(2)
+        with col_bottom[0]:
+            min_videos_per_tag_radar = st.number_input(
+                "Минимум видео с тегом в снапшоте",
+                min_value=1,
+                max_value=50,
+                value=2,
+                step=1,
+                key="sandbox_tag_min_videos",
+            )
+        with col_bottom[1]:
+            run_tag_radar = st.button(
+                "Посчитать динамику по тегу",
+                type="primary",
+                key="sandbox_tag_run",
+            )
+
+        if run_tag_radar:
+            if not search_tag.strip():
+                st.warning("Сначала введи тег или часть тега.")
+            else:
+                df_base = full_df.copy()
+
+                # фильтр по категории
+                if cat_option_tag != "Все категории":
+                    m_cat = re.search(r"id=(\d+)", cat_option_tag)
+                    if m_cat:
+                        cat_id_selected = m_cat.group(1)
+                        df_base = df_base[df_base["category_id"] == str(cat_id_selected)]
+
+                if df_base.empty:
+                    st.warning("По выбранной категории данных нет.")
+                else:
+                    time_rows = []
+                    per_tag_rows = []
+                    pattern = search_tag.strip().lower()
+
+                    # проходим по всем снапшотам
+                    for ts in snapshots:
+                        df_ts = df_base[df_base["snapshot_ts"] == ts].copy()
+                        if df_ts.empty:
+                            continue
+
+                        tag_metrics_ts = compute_tag_metrics_for_df_slice(
+                            df_ts,
+                            fresh_hours=fresh_hours_tag_radar,
+                            min_videos_per_tag=min_videos_per_tag_radar,
+                        )
+                        if tag_metrics_ts.empty:
+                            continue
+
+                        # фильтруем метрики по тегу / подстроке
+                        if match_mode == "Точное совпадение":
+                            mask = tag_metrics_ts["tag"].str.lower() == pattern
+                        else:
+                            mask = tag_metrics_ts["tag"].str.lower().str.contains(
+                                pattern
+                            )
+
+                        tag_sel = tag_metrics_ts[mask].copy()
+                        if tag_sel.empty:
+                            continue
+
+                        # агрегат по снапшоту
+                        time_rows.append(
+                            {
+                                "snapshot_ts": ts,
+                                "volume": float(tag_sel["volume"].sum()),
+                                "velocity": float(tag_sel["velocity"].sum()),
+                                "freshness": float(tag_sel["freshness"].mean()),
+                                "tags_cnt": int(len(tag_sel)),
+                            }
+                        )
+
+                        # построчно для тепловой карты
+                        for _, row in tag_sel.iterrows():
+                            per_tag_rows.append(
+                                {
+                                    "snapshot_ts": ts,
+                                    "tag": row["tag"],
+                                    "volume": float(row["volume"]),
+                                    "velocity": float(row["velocity"]),
+                                    "freshness": float(row["freshness"]),
+                                }
+                            )
+
+                    if not time_rows:
+                        st.warning(
+                            "Не нашлось тегов с такими условиями ни в одном снапшоте."
+                        )
+                    else:
+                        df_time = pd.DataFrame(time_rows).sort_values("snapshot_ts")
+                        df_time["snapshot_label"] = df_time["snapshot_ts"].map(
+                            snap_labels
+                        )
+
+                        st.markdown("### 1. Тайм-серия по суммарным метрикам")
+
+                        base_chart = alt.Chart(df_time).encode(
+                            x=alt.X(
+                                "snapshot_ts:T",
+                                title="Снапшот во времени",
+                            )
+                        )
+
+                        chart_vel = (
+                            base_chart.mark_line(point=True)
+                            .encode(
+                                y=alt.Y(
+                                    "velocity:Q",
+                                    title="Скорость новых видео (сумма velocity по тегам)",
+                                ),
+                                tooltip=[
+                                    "snapshot_label:N",
+                                    "velocity:Q",
+                                    "volume:Q",
+                                    "freshness:Q",
+                                    "tags_cnt:Q",
+                                ],
+                            )
+                            .properties(height=250, title="Скорость новых видео по тегу")
+                        )
+
+                        chart_vol = (
+                            base_chart.mark_line(point=True)
+                            .encode(
+                                y=alt.Y(
+                                    "volume:Q",
+                                    title="Объём просмотров (сумма volume по тегам)",
+                                ),
+                                tooltip=[
+                                    "snapshot_label:N",
+                                    "volume:Q",
+                                    "velocity:Q",
+                                    "freshness:Q",
+                                    "tags_cnt:Q",
+                                ],
+                            )
+                            .properties(height=250, title="Объём просмотров по тегу")
+                        )
+
+                        chart_fresh = (
+                            base_chart.mark_line(point=True)
+                            .encode(
+                                y=alt.Y(
+                                    "freshness:Q",
+                                    title="Средняя свежесть (0–1)",
+                                ),
+                                tooltip=[
+                                    "snapshot_label:N",
+                                    "freshness:Q",
+                                    "volume:Q",
+                                    "velocity:Q",
+                                    "tags_cnt:Q",
+                                ],
+                            )
+                            .properties(
+                                height=250,
+                                title="Средняя доля свежих видео по тегу",
+                            )
+                        )
+
+                        st.altair_chart(chart_vel, use_container_width=True)
+                        st.altair_chart(chart_vol, use_container_width=True)
+                        st.altair_chart(chart_fresh, use_container_width=True)
+
+                        st.markdown("### 2. Тепловая карта: тег × снапшот")
+
+                        if per_tag_rows:
+                            df_per_tag = pd.DataFrame(per_tag_rows)
+
+                            # топ-20 тегов по суммарному объёму
+                            top_tags = (
+                                df_per_tag.groupby("tag")["volume"]
+                                .sum()
+                                .sort_values(ascending=False)
+                                .head(20)
+                                .index
+                            )
+                            heat_df = df_per_tag[
+                                df_per_tag["tag"].isin(top_tags)
+                            ].copy()
+                            heat_df["snapshot_label"] = heat_df["snapshot_ts"].map(
+                                snap_labels
+                            )
+
+                            heat_chart = (
+                                alt.Chart(heat_df)
+                                .mark_rect()
+                                .encode(
+                                    x=alt.X(
+                                        "snapshot_ts:T",
+                                        title="Снапшот",
+                                    ),
+                                    y=alt.Y(
+                                        "tag:N",
+                                        title="Тег",
+                                        sort="-x",
+                                    ),
+                                    color=alt.Color(
+                                        "velocity:Q",
+                                        title="Скорость новых видео (velocity)",
+                                    ),
+                                    tooltip=[
+                                        "tag:N",
+                                        "snapshot_label:N",
+                                        "volume:Q",
+                                        "velocity:Q",
+                                        "freshness:Q",
+                                    ],
+                                )
+                                .properties(
+                                    height=400,
+                                    title="Тепловая карта скорости новых видео по тегам",
+                                )
+                            )
+
+                            st.altair_chart(heat_chart, use_container_width=True)
+                        else:
+                            st.info(
+                                "Недостаточно данных для тепловой карты по тегам."
+                            )
+
+                        st.markdown("### 3. Срез по тегам в последнем снапшоте")
+
+                        last_ts = snapshots[-1]
+                        df_last = df_base[df_base["snapshot_ts"] == last_ts].copy()
+                        tag_metrics_last = compute_tag_metrics_for_df_slice(
+                            df_last,
+                            fresh_hours=fresh_hours_tag_radar,
+                            min_videos_per_tag=min_videos_per_tag_radar,
+                        )
+                        if not tag_metrics_last.empty:
+                            if match_mode == "Точное совпадение":
+                                mask_last = (
+                                    tag_metrics_last["tag"].str.lower() == pattern
+                                )
+                            else:
+                                mask_last = (
+                                    tag_metrics_last["tag"]
+                                    .str.lower()
+                                    .str.contains(pattern)
+                                )
+
+                            tag_last_sel = tag_metrics_last[mask_last].copy()
+                            if tag_last_sel.empty:
+                                st.info(
+                                    "В последнем снапшоте для этого тега нет совпадений."
+                                )
+                            else:
+                                st.markdown(
+                                    f"Последний снапшот: **{snap_labels[last_ts]}**"
+                                )
+                                st.dataframe(
+                                    tag_last_sel.sort_values(
+                                        "velocity", ascending=False
+                                    ).head(50),
+                                    use_container_width=True,
+                                )
+                        else:
+                            st.info(
+                                "В последнем снапшоте не удалось посчитать метрики по тегам."
+                            )
+
+    # ---------- Вкладка 2: фильтр сырых строк ----------
+    with tab_snap:
+        st.markdown("#### Фильтры для данных из папки со снапшотами")
+
+        col_filters_top = st.columns(3)
+        with col_filters_top[0]:
+            snap_option = st.selectbox(
+                "Снапшот",
+                options=["Все снапшоты"] + [snap_labels[ts] for ts in snapshots],
+                index=0,
+                key="sandbox_snap",
+            )
+
+        with col_filters_top[1]:
+            cat_option_sandbox = st.selectbox(
+                "Категория",
+                options=cat_display_list,
+                index=0,
+                key="sandbox_cat",
+            )
+
+        with col_filters_top[2]:
+            shorts_filter_sandbox = st.selectbox(
+                "Тип видео",
+                options=["Все", "Только shorts", "Только не shorts"],
+                index=0,
+                key="sandbox_shorts",
+            )
+
+        col_filters_bottom = st.columns(3)
+        with col_filters_bottom[0]:
+            min_views = st.number_input(
+                "Минимум просмотров (views)",
+                min_value=0,
+                value=0,
+                step=1000,
+                key="sandbox_min_views",
+            )
+        with col_filters_bottom[1]:
+            min_vph = st.number_input(
+                "Минимум скорости (views_per_hour)",
+                min_value=0.0,
+                value=0.0,
+                step=100.0,
+                key="sandbox_min_vph",
+            )
+        with col_filters_bottom[2]:
+            max_rows = st.number_input(
+                "Сколько строк показывать",
+                min_value=10,
+                max_value=10000,
+                value=500,
+                step=10,
+                key="sandbox_max_rows",
+            )
+
+        df_view = full_df.copy()
+
+        # фильтр по снапшоту
+        if snap_option != "Все снапшоты":
+            ts_selected = None
+            for ts, label in snap_labels.items():
+                if label == snap_option:
+                    ts_selected = ts
+                    break
+            if ts_selected is not None:
+                df_view = df_view[df_view["snapshot_ts"] == ts_selected]
+
+        # фильтр по категории
+        if cat_option_sandbox != "Все категории":
+            m = re.search(r"id=(\d+)", cat_option_sandbox)
+            if m:
+                cat_id_selected = m.group(1)
+                df_view = df_view[df_view["category_id"] == str(cat_id_selected)]
+
+        # фильтр по shorts
+        if "from_shorts" in df_view.columns:
+            if shorts_filter_sandbox == "Только shorts":
+                df_view = df_view[df_view["from_shorts"] == 1]
+            elif shorts_filter_sandbox == "Только не shorts":
+                df_view = df_view[df_view["from_shorts"] == 0]
+
+        # фильтр по views / views_per_hour
+        if "views" in df_view.columns:
+            df_view["views"] = pd.to_numeric(
+                df_view["views"], errors="coerce"
+            ).fillna(0)
+            df_view = df_view[df_view["views"] >= min_views]
+
+        if "views_per_hour" in df_view.columns:
+            df_view["views_per_hour"] = pd.to_numeric(
+                df_view["views_per_hour"], errors="coerce"
+            ).fillna(0.0)
+            df_view = df_view[df_view["views_per_hour"] >= min_vph]
+
+        if df_view.empty:
+            st.warning("По этим фильтрам данных нет.")
+        else:
+            st.markdown(
+                f"Показываем первые {min(len(df_view), int(max_rows))} строк."
+            )
+            st.dataframe(
+                df_view.head(int(max_rows)),
+                use_container_width=True,
+            )
+
+            csv_bytes = df_view.to_csv(index=False).encode("utf-8")
+            st.download_button(
+                "Скачать отфильтрованные данные в CSV",
+                data=csv_bytes,
+                file_name="yt_radar_filtered.csv",
+                mime="text/csv",
+                key="sandbox_download",
+            )
+
+            with st.expander("Описание числовых колонок (describe)"):
+                numeric_desc = df_view.describe(include="number")
+                st.dataframe(numeric_desc, use_container_width=True)
+
+    # ---------- Вкладка 3: загрузка CSV вручную ----------
+    with tab_upload:
+        st.markdown(
+            """
+Можно загрузить любой CSV-файл (например, свежий снапшот) и посмотреть его содержимое.
+
+Файл никак не вмешивается в основную логику приложения, это просто песочница.
+"""
+        )
+
+        uploaded_file = st.file_uploader(
+            "Загрузи CSV-файл",
+            type=["csv"],
+            key="sandbox_file_uploader",
+        )
+
+        if uploaded_file is not None:
+            try:
+                df_uploaded = pd.read_csv(uploaded_file)
+            except Exception as e:
+                st.error(f"Не удалось прочитать файл как CSV: {e}")
+                df_uploaded = None
+
+            if df_uploaded is not None:
+                st.markdown("#### Первые строки загруженного файла")
+                st.dataframe(df_uploaded.head(500), use_container_width=True)
+
+                st.markdown("#### Колонки и типы данных")
+                dtypes_df = pd.DataFrame(
+                    {
+                        "column": df_uploaded.columns,
+                        "dtype": [str(t) for t in df_uploaded.dtypes],
+                    }
+                )
+                st.table(dtypes_df)
+
+                with st.expander("Описание числовых колонок (describe)"):
+                    st.dataframe(
+                        df_uploaded.describe(include="number"),
+                        use_container_width=True,
+                    )
+        else:
+            st.info(
+                "Файл ещё не загружен. Выбери CSV выше, чтобы посмотреть его в песочнице."
+            )
